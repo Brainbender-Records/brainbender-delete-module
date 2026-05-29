@@ -1,0 +1,5 @@
+name = Brainbender Delete Module
+description = Find disabled and uninstalled modules and delete their files from the server.
+core = 7.x
+package = Administration
+configure = admin/config/system/brainbender-delete

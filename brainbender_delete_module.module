@@ -1,0 +1,196 @@
+<?php
+
+function brainbender_delete_module_permission() {
+  return array(
+    'administer brainbender' => array(
+      'title' => t('Administer Brainbender Delete Module'),
+      'description' => t('View and delete disabled or uninstalled module files.'),
+    ),
+  );
+}
+
+function brainbender_delete_module_menu() {
+  $items['admin/config/system/brainbender-delete'] = array(
+    'title' => 'Brainbender Delete Module',
+    'description' => 'Delete files of disabled or uninstalled modules.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('brainbender_delete_module_form'),
+    'access callback' => 'user_access',
+    'access arguments' => array('administer brainbender'),
+    'type' => MENU_NORMAL_ITEM,
+  );
+  return $items;
+}
+
+function brainbender_delete_module_form($form, &$form_state) {
+  $modules = _brainbender_get_deletable_modules();
+
+  if (empty($modules)) {
+    drupal_set_message(t('No disabled or uninstalled modules found with files on disk.'));
+    return array();
+  }
+
+  $form['warning'] = array(
+    '#markup' => '<p><strong>' . t('Warning:') . '</strong> '
+      . t('Deleting a module permanently removes its files from the server. This cannot be undone.') . '</p>',
+  );
+
+  $form['list'] = array(
+    '#type' => 'tableselect',
+    '#header' => array(
+      'name' => t('Name'),
+      'machine' => t('Machine name'),
+      'status' => t('Status'),
+      'path' => t('Path'),
+    ),
+    '#options' => array(),
+  );
+
+  foreach ($modules as $key => $module) {
+    $form['list']['#options'][$key] = array(
+      'name' => check_plain($module['title']),
+      'machine' => check_plain($key),
+      'status' => $module['label'],
+      'path' => check_plain($module['path']),
+    );
+  }
+
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Delete selected modules'),
+  );
+
+  return $form;
+}
+
+function brainbender_delete_module_form_validate($form, &$form_state) {
+  $selected = array_filter($form_state['values']['list']);
+  if (empty($selected)) {
+    form_set_error('list', t('Select at least one module to delete.'));
+  }
+}
+
+function brainbender_delete_module_form_submit($form, &$form_state) {
+  $selected = array_filter($form_state['values']['list']);
+  $modules = _brainbender_get_deletable_modules();
+  $done = array();
+  $fail = array();
+
+  foreach ($selected as $name) {
+    if (!isset($modules[$name])) {
+      $fail[] = $name;
+      continue;
+    }
+    $path = $modules[$name]['path'];
+    if (is_dir($path) && _brainbender_delete_dir($path)) {
+      db_delete('system')
+        ->condition('type', 'module')
+        ->condition('name', $name)
+        ->execute();
+      $done[] = $name;
+    }
+    else {
+      $fail[] = $name;
+    }
+  }
+
+  if ($done) {
+    drupal_set_message(t('Deleted: @list', array('@list' => implode(', ', $done))));
+  }
+  if ($fail) {
+    drupal_set_message(t('Failed: @list', array('@list' => implode(', ', $fail))), 'error');
+  }
+
+  system_rebuild_module_data();
+}
+
+function _brainbender_get_deletable_modules() {
+  $result = array();
+
+  $rows = db_query("SELECT name, status, filename FROM {system} WHERE type = 'module'")->fetchAllAssoc('name');
+
+  foreach ($rows as $name => $row) {
+    if ($row->status == 1) {
+      continue;
+    }
+    $dir = dirname($row->filename);
+    $info = DRUPAL_ROOT . '/' . $dir . '/' . $name . '.info';
+    if (!is_dir(DRUPAL_ROOT . '/' . $dir)) {
+      continue;
+    }
+    $parsed = drupal_parse_info_file($info);
+    $result[$name] = array(
+      'title' => ($parsed && isset($parsed['name'])) ? $parsed['name'] : $name,
+      'label' => t('Disabled'),
+      'path' => DRUPAL_ROOT . '/' . $dir,
+    );
+  }
+
+  $all_names = array_keys($rows);
+
+  $search = array(
+    'sites/all/modules',
+    conf_path() . '/modules',
+    'profiles/' . drupal_get_profile() . '/modules',
+  );
+
+  $found = array();
+  foreach ($search as $dir) {
+    if (is_dir($dir)) {
+      _brainbender_scan($dir, $found);
+    }
+  }
+
+  foreach ($found as $info_file) {
+    $parsed = drupal_parse_info_file($info_file);
+    if (!$parsed || !isset($parsed['core'])) {
+      continue;
+    }
+    $dir_path = dirname($info_file);
+    $name = basename($dir_path);
+    if (!in_array($name, $all_names) && !isset($result[$name])) {
+      $result[$name] = array(
+        'title' => isset($parsed['name']) ? $parsed['name'] : $name,
+        'label' => t('Uninstalled'),
+        'path' => $dir_path,
+      );
+    }
+  }
+
+  ksort($result);
+  return $result;
+}
+
+function _brainbender_scan($dir, &$found) {
+  $items = glob($dir . '/*', GLOB_ONLYDIR);
+  if (!$items) {
+    return;
+  }
+  foreach ($items as $item) {
+    $base = basename($item);
+    $info = $item . '/' . $base . '.info';
+    if (file_exists($info)) {
+      $found[] = $info;
+    }
+    _brainbender_scan($item, $found);
+  }
+}
+
+function _brainbender_delete_dir($path) {
+  if (!is_dir($path)) {
+    return FALSE;
+  }
+  $it = new RecursiveIteratorIterator(
+    new RecursiveDirectoryIterator($path, RecursiveDirectoryIterator::SKIP_DOTS),
+    RecursiveIteratorIterator::CHILD_FIRST
+  );
+  foreach ($it as $f) {
+    if ($f->isDir()) {
+      rmdir($f->getRealPath());
+    }
+    else {
+      drupal_unlink($f->getRealPath());
+    }
+  }
+  return rmdir($path);
+}
